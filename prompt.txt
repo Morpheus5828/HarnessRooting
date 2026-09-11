@@ -1,1 +1,10 @@
-
+Je voudrais ajouter ces fonctionalitées la stp: (click and root)
+- Dans le mode click and root, donner la possibilité à l'utilisateur de refaire un rooting.
+- A la fin du routage intégrer automatiquement MOMOS.py qui va checker les règles via le fichier config.py/ il va ensuite ouvrir une nouvelle fenêtre 3D pour voir l'intégralité des règles HS etc.
+- Ajoute le path du crabe auto dans config.py "CRAB_PATH: .stl"
+- la possibilité de choisir entre HRH ou SHRH.
+- Ajoute un logo lors de l'ouverture de l'application avec marqué HarnessOpt, an AI application help designer for harness rooting. avec le logo d'un helico.
+- Améliore le mintueur et sa fluidité rend le plus estéhtique à voir.
+- Pour connecter les connecteurs choisir par l'utilisateur aux harnais tu vas suivre le raisonnement suivant: calcul la bbox du connecteur, détecter la face la plus proche du harnais et prendre le centre de cette face comme départ/arrivé
+- Ajoute un CONTROLE Z si l'utilisateur a clicker sur le mauvais connecteur au début.
+- Améliore l'IHM avec un design un peu comme apple stp. un CSS soigné.
