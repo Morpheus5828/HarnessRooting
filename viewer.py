@@ -90,6 +90,8 @@ def scene_payload(scene_stl=None, harness_stl=None, polylines=None,
         crabs=[[[float(v) for v in np.asarray(M).ravel()],
                 float(dx), float(dy), float(h)] for M, dx, dy, h in (crabs or [])],
         crab_stl=str(crab_stl) if crab_stl else None,
+        # controle des regles HS (MOMOS) : rempli par `MOMOS.payload`
+        rules=[],
     )
 
 
@@ -182,12 +184,148 @@ def show(payload: dict):
     except Exception:
         pass
     pl.add_axes()
-    try:
-        enable_edit(pl, payload)
-    except Exception as exc:                 # la retouche est un plus
-        LOG.warn(f"mode retouche indisponible ({type(exc).__name__} : {exc}) : "
-                 f"la vue 3D reste utilisable")
+
+    if payload.get("rules"):
+        try:
+            show_rules(pl, payload)
+        except Exception as exc:
+            LOG.warn(f"panneau des regles indisponible "
+                     f"({type(exc).__name__} : {exc})")
+    else:
+        try:
+            enable_edit(pl, payload)
+        except Exception as exc:             # la retouche est un plus
+            LOG.warn(f"mode retouche indisponible ({type(exc).__name__} : "
+                     f"{exc}) : la vue 3D reste utilisable")
     pl.show()
+
+
+# --------------------------------------------------------------------------
+# fenetre des regles HS (MOMOS)
+# --------------------------------------------------------------------------
+
+STATUT_COULEUR = {"ok": "#2E9E5B", "warn": "#E0A03B", "ko": "#D2483F",
+                  "na": "#8A99A8"}
+
+
+def show_rules(pl, payload):
+    """
+    Affiche l'INTEGRALITE des regles HS par-dessus la scene.
+
+    A gauche, la liste des regles, une ligne par regle, coloree par son
+    verdict. Dans la scene, chaque violation est pointee par une pastille de
+    la meme couleur : on lit la regle, on voit ou elle est violee.
+
+    Les touches 1 / 2 / 3 filtrent l'affichage (tout, violations, limites),
+    O masque ou rend les pastilles.
+    """
+    import pyvista as pv
+
+    regles = payload.get("rules") or []
+    rayon = float(payload.get("rules_marker_radius") or 12.0)
+
+    # --- pastilles de violation, un acteur par regle ---
+    acteurs = {}
+    for regle in regles:
+        pts = np.asarray(regle.get("points") or [], float).reshape(-1, 3)
+        if not len(pts):
+            continue
+        couleur = regle.get("color") or STATUT_COULEUR.get(regle.get("status"),
+                                                           "#8A99A8")
+        try:
+            boules = pv.PolyData(pts).glyph(geom=pv.Sphere(radius=rayon),
+                                            scale=False, orient=False)
+            acteurs[regle["code"]] = pl.add_mesh(
+                boules, color=couleur, opacity=0.85,
+                name=f"regle-{regle['code']}")
+        except Exception:
+            continue
+
+    # --- panneau de gauche : toutes les regles ---
+    etat = dict(filtre="tout", pastilles=True)
+
+    def lignes(filtre):
+        titre = payload.get("rules_title") or "REGLES HS"
+        resume = payload.get("rules_summary") or ""
+        stamp = payload.get("rules_stamp") or ""
+        out = [f"{titre}   -   {resume}"]
+        if stamp:
+            out.append(f"controle du {stamp}")
+        out.append("")
+        famille = None
+        for regle in regles:
+            if filtre == "violations" and regle.get("status") != "ko":
+                continue
+            if filtre == "limites" and regle.get("status") not in ("ko", "warn"):
+                continue
+            if regle.get("family") != famille:
+                famille = regle.get("family")
+                out.append(f"-- {famille}")
+            out.append("  " + (regle.get("line") or regle.get("code", "")))
+            if regle.get("detail") and regle.get("status") in ("ko", "warn"):
+                out.append(f"        {regle['detail']}")
+        if len(out) <= 3:
+            out.append("  aucune regle dans ce filtre.")
+        out.append("")
+        out.append("1 toutes   2 violations   3 limites   O pastilles")
+        return "\n".join(out)
+
+    couleur_globale = STATUT_COULEUR.get(payload.get("rules_status"), "#12233A")
+    panneau = pl.add_text(lignes("tout"), position="upper_left", font_size=8,
+                          color="#12233A")
+
+    def redessine():
+        texte = lignes(etat["filtre"])
+        for ecrire in (lambda: panneau.SetText(2, texte),
+                       lambda: panneau.SetInput(texte)):
+            try:
+                ecrire()
+                break
+            except Exception:
+                continue
+        try:
+            pl.render()
+        except Exception:
+            pass
+
+    def filtre(nom):
+        etat["filtre"] = nom
+        redessine()
+
+    def bascule_pastilles():
+        etat["pastilles"] = not etat["pastilles"]
+        for acteur in acteurs.values():
+            try:
+                acteur.SetVisibility(etat["pastilles"])
+            except Exception:
+                pass
+        redessine()
+
+    for touche, nom in (("1", "tout"), ("2", "violations"), ("3", "limites")):
+        try:
+            pl.add_key_event(touche, lambda n=nom: filtre(n))
+        except Exception:
+            pass
+    for touche in ("o", "O"):
+        try:
+            pl.add_key_event(touche, lambda: bascule_pastilles())
+        except Exception:
+            pass
+
+    # --- verdict global, en bas ---
+    compte = {}
+    for regle in regles:
+        compte[regle.get("status")] = compte.get(regle.get("status"), 0) + 1
+    verdict = {"ok": "CONFORME", "warn": "CONFORME AVEC RESERVES",
+               "ko": "NON CONFORME"}.get(payload.get("rules_status"),
+                                         "CONTROLE PARTIEL")
+    try:
+        pl.add_text(f"MOMOS : {verdict}", position="lower_left", font_size=12,
+                    color=couleur_globale)
+    except Exception:
+        pass
+    LOG.info(f"regles HS affichees : {len(regles)} regle(s), "
+             f"{compte.get('ko', 0)} violee(s)")
 
 
 # --------------------------------------------------------------------------

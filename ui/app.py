@@ -8,7 +8,7 @@ from .page_import import ImportPage
 from .page_routing import RoutingPage
 from .plots import set_figure_scale
 
-VERSION = "1.0.0"
+VERSION = "1.1.0"
 TITLE = "HarnessOpt - cheminement de harnais helicoptere"
 
 STEPS = [("import", "1", "Maquette 3D", "Importer l'environnement CATIA"),
@@ -23,20 +23,24 @@ class StepBar(tk.Frame):
         self.items = {}
         for i, (key, num, title, subtitle) in enumerate(STEPS):
             if i:
-                tk.Label(self, text=">", bg=C["primary"], fg="#5C7CB0",
+                tk.Label(self, text="\u203a", bg=C["primary"],
+                         fg=C["on_primary_soft"],
                          font=FONTS["h3"]).pack(side=tk.LEFT, padx=10)
             item = tk.Frame(self, bg=C["primary"], cursor="hand2")
             item.pack(side=tk.LEFT)
-            badge = tk.Label(item, text=num, bg="#1B3A73", fg="#8FB2E0",
+            badge = tk.Label(item, text=num, bg=C["primary_alt"],
+                             fg=C["on_primary_muted"],
                              font=FONTS["badge"], width=3, height=1)
             badge.pack(side=tk.LEFT, padx=(0, 8), pady=2)
             texts = tk.Frame(item, bg=C["primary"])
             texts.pack(side=tk.LEFT)
-            lbl = tk.Label(texts, text=title, bg=C["primary"], fg="#9FB6D9",
-                           font=FONTS["bold"], anchor="w")
+            lbl = tk.Label(texts, text=title, bg=C["primary"],
+                           fg=C["on_primary_muted"], font=FONTS["bold"],
+                           anchor="w")
             lbl.pack(anchor="w")
-            sub = tk.Label(texts, text=subtitle, bg=C["primary"], fg="#5C7CB0",
-                           font=FONTS["tiny"], anchor="w")
+            sub = tk.Label(texts, text=subtitle, bg=C["primary"],
+                           fg=C["on_primary_soft"], font=FONTS["tiny"],
+                           anchor="w")
             sub.pack(anchor="w")
             for w in (item, badge, texts, lbl, sub):
                 w.bind("<Button-1>", lambda e, k=key: self.on_click(k))
@@ -45,10 +49,11 @@ class StepBar(tk.Frame):
     def select(self, key):
         for k, (badge, lbl, sub) in self.items.items():
             active = (k == key)
-            badge.config(bg=C["accent"] if active else "#1B3A73",
-                         fg="#FFFFFF" if active else "#8FB2E0")
-            lbl.config(fg="#FFFFFF" if active else "#9FB6D9")
-            sub.config(fg="#B9CDE0" if active else "#5C7CB0")
+            badge.config(bg=C["accent"] if active else C["primary_alt"],
+                         fg=C["on_primary"] if active else C["on_primary_muted"])
+            lbl.config(fg=C["on_primary"] if active else C["on_primary_muted"])
+            sub.config(fg=C["on_primary_muted"] if active
+                       else C["on_primary_soft"])
 
 
 class HarnessAppView:
@@ -84,13 +89,19 @@ class HarnessAppView:
         head.pack(fill=tk.X)
         head.pack_propagate(False)
 
+        from .splash import logo_mark
+
         left = tk.Frame(head, bg=C["primary"])
         left.pack(side=tk.LEFT, padx=18)
-        tk.Label(left, text="HarnessOpt", bg=C["primary"], fg="#FFFFFF",
-                 font=FONTS["h1"]).pack(anchor="w", pady=(10, 0))
-        tk.Label(left, text="Cheminement automatique de harnais - "
-                            "heuristique HRH (Karlsson et al., 2023)",
-                 bg=C["primary"], fg="#8FB2E0",
+        logo_mark(left, 44).pack(side=tk.LEFT, padx=(0, 12), pady=12)
+        titres = tk.Frame(left, bg=C["primary"])
+        titres.pack(side=tk.LEFT)
+        tk.Label(titres, text="HarnessOpt", bg=C["primary"],
+                 fg=C["on_primary"], font=FONTS["h1"]).pack(anchor="w",
+                                                            pady=(10, 0))
+        tk.Label(titres, text="an AI application help designer for harness "
+                              "rooting  -  HRH / SHRH",
+                 bg=C["primary"], fg=C["on_primary_muted"],
                  font=FONTS["tiny"]).pack(anchor="w")
 
         # Le bouton navigue en appelant le contrôleur
@@ -99,11 +110,12 @@ class HarnessAppView:
 
         right = tk.Frame(head, bg=C["primary"])
         right.pack(side=tk.RIGHT, padx=18)
-        self.lbl_catia = tk.Label(right, text="", bg=C["primary"], fg="#8FB2E0",
+        self.lbl_catia = tk.Label(right, text="", bg=C["primary"],
+                                  fg=C["on_primary_muted"],
                                   font=FONTS["small"], justify="right")
         self.lbl_catia.pack(anchor="e", pady=(16, 0))
-        tk.Label(right, text=f"v{VERSION}", bg=C["primary"], fg="#4E6FA6",
-                 font=FONTS["tiny"]).pack(anchor="e")
+        tk.Label(right, text=f"v{VERSION}", bg=C["primary"],
+                 fg=C["on_primary_soft"], font=FONTS["tiny"]).pack(anchor="e")
 
     def _build_body(self):
         self.container = tk.Frame(self.root, bg=C["bg"])

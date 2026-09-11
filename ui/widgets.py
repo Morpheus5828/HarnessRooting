@@ -8,59 +8,241 @@ Windows, Linux et macOS.
 """
 
 from __future__ import annotations
+import math
 import time
 import queue
 import tkinter as tk
 from tkinter import ttk
 
-from .theme import C, FONTS
+from .theme import C, FONTS, RADIUS, mix, round_rect
 from .. import log as applog
 from ..core.tool import _duree as format_duree
 
 
+def format_chrono(secondes) -> str:
+    """
+    Duree lisible d'un coup d'oeil, au dixieme de seconde.
+
+    Le dixieme n'est pas de la precision : c'est ce qui fait vivre le
+    minuteur. Sans lui, un calcul de trois minutes affiche un nombre fige, et
+    l'utilisateur se demande si l'application a decroche.
+    """
+    s = max(0.0, float(secondes))
+    if s < 60.0:
+        return f"{s:.1f} s"
+    minutes, reste = divmod(s, 60.0)
+    if minutes < 60:
+        return f"{int(minutes)}:{reste:04.1f}"
+    heures, minutes = divmod(int(minutes), 60)
+    return f"{heures}:{minutes:02d}:{int(reste):02d}"
+
+
 class Spinner(tk.Canvas):
-    TAILLE = 132
+    """
+    Minuteur du calcul : un anneau qui tourne, et le temps ecoule au centre.
+
+    Trois choses le rendent fluide la ou un `after(40)` classique saccade :
+
+    * l'angle est calcule a partir de l'HORLOGE (`time.monotonic`), pas
+      incremente d'un pas fixe : une image sautee ne decale plus l'anneau, la
+      rotation garde sa vitesse quoi qu'il arrive ;
+    * la comete est faite d'une vingtaine d'arcs dont la couleur s'eteint
+      progressivement : l'oeil lit un degrade, pas un segment qui clignote ;
+    * sa longueur RESPIRE (elle s'allonge puis se retracte), ce qui donne
+      l'impression d'une avance continue meme quand le calcul ne sait pas
+      dire ou il en est.
+
+    En mode determine (`set_progress`), la comete laisse la place a un arc
+    de progression et le pourcentage s'affiche sous le chrono.
+    """
+
+    TAILLE = 164
     EPAISSEUR = 9
+    SEGMENTS = 22                 # longueur du degrade de la comete
+    TOUR_S = 2.6                  # duree d'un tour complet, en secondes
+    PERIODE = 16                  # une image toutes les 16 ms = 60 par seconde
 
-    def __init__(self, parent, texte="Rooting is loading, please wait"):
-        super().__init__(parent, width=self.TAILLE, height=self.TAILLE,
-                         bg=C["surface"], highlightthickness=0)
+    def __init__(self, parent, texte="", taille=None, bg=None):
+        taille = int(taille or self.TAILLE)
+        bg = bg or C["surface"]
+        super().__init__(parent, width=taille, height=taille, bg=bg,
+                         highlightthickness=0, bd=0)
+        self.taille = taille
         self.texte = texte
-        self._angle = 0
         self._t0 = None
+        self._fige = 0.0              # duree gelee apres un stop()
         self._job = None
-        marge = self.EPAISSEUR
-        self._boite = (marge, marge, self.TAILLE - marge, self.TAILLE - marge)
+        self._ratio = None            # None = mode indetermine
+        self._dernier_texte = ""
 
-        # Explicit coordinates instead of *unpacking to satisfy type checkers
-        x0, y0, x1, y1 = self._boite
-        self.create_oval(x0, y0, x1, y1, outline=C["border"],
+        marge = self.EPAISSEUR + 6
+        x0, y0, x1, y1 = marge, marge, taille - marge, taille - marge
+
+        # piste : un anneau tres clair, jamais noir -- c'est ce qui donne la
+        # legerete d'une interface Apple.
+        self.create_oval(x0, y0, x1, y1, outline=C["border_soft"],
                          width=self.EPAISSEUR)
-        self._arc = self.create_arc(x0, y0, x1, y1, start=0, extent=90,
-                                    style=tk.ARC, outline=C["accent"],
-                                    width=self.EPAISSEUR)
-        self._chrono = self.create_text(self.TAILLE // 2, self.TAILLE // 2,
-                                        text="0 s", fill=C["text"],
-                                        font=FONTS["kpi"])
 
-    def start(self):
-        self._t0 = time.time()
-        self._anime()
+        pas = 360.0 / self.SEGMENTS
+        self._queue_arcs = []
+        for i in range(self.SEGMENTS):
+            # du plus vif (tete) au presque invisible (fin de comete)
+            t = i / float(self.SEGMENTS - 1)
+            couleur = mix(C["accent"], C["border_soft"], t ** 0.85)
+            self._queue_arcs.append(self.create_arc(
+                x0, y0, x1, y1, start=0, extent=-pas * 1.06, style=tk.ARC,
+                outline=couleur, width=self.EPAISSEUR))
 
-    def stop(self):
+        self._arc_progres = self.create_arc(x0, y0, x1, y1, start=90,
+                                            extent=0, style=tk.ARC,
+                                            outline=C["accent"],
+                                            width=self.EPAISSEUR,
+                                            state=tk.HIDDEN)
+        self._tete = self.create_oval(0, 0, 0, 0, outline="", fill=C["accent"],
+                                      state=tk.HIDDEN)
+        self._chrono = self.create_text(taille // 2, taille // 2 - 9,
+                                        text="0.0 s", fill=C["text"],
+                                        font=FONTS["timer"])
+        self._sous_titre = self.create_text(taille // 2, taille // 2 + 22,
+                                            text=texte, fill=C["faint"],
+                                            font=FONTS["timer_small"],
+                                            width=taille - 4 * self.EPAISSEUR)
+        self.bind("<Destroy>", lambda _e: self.stop())
+
+    # -- pilotage ------------------------------------------------------
+    def start(self, texte=None):
+        if texte is not None:
+            self.set_caption(texte)
+        self._t0 = time.monotonic()
+        self._fige = 0.0
+        self.itemconfigure(self._tete, state=tk.NORMAL)
+        if self._job is None:
+            self._anime()
+
+    def stop(self, garder_chrono=True):
+        """Arrete l'animation. Le chrono reste affiche sur sa derniere valeur."""
         if self._job is not None:
-            self.after_cancel(self._job)
+            try:
+                self.after_cancel(self._job)
+            except tk.TclError:
+                pass
             self._job = None
+        if self._t0 is not None:
+            self._fige = time.monotonic() - self._t0
+        self._t0 = None
+        try:
+            self.itemconfigure(self._tete, state=tk.HIDDEN)
+            for arc in self._queue_arcs:
+                self.itemconfigure(arc, state=tk.HIDDEN)
+            if not garder_chrono:
+                self.itemconfigure(self._chrono, text="0.0 s")
+        except tk.TclError:
+            pass
+
+    def reset(self):
+        self.stop(garder_chrono=False)
+        self._fige = 0.0
+        self._ratio = None
+        try:
+            self.itemconfigure(self._arc_progres, state=tk.HIDDEN)
+            for arc in self._queue_arcs:
+                self.itemconfigure(arc, state=tk.NORMAL)
+            self.itemconfigure(self._chrono, text="0.0 s", fill=C["text"])
+        except tk.TclError:
+            pass
 
     def elapsed(self) -> float:
-        return 0.0 if self._t0 is None else time.time() - self._t0
+        if self._t0 is None:
+            return self._fige
+        return time.monotonic() - self._t0
 
+    def set_caption(self, texte):
+        self.texte = texte or ""
+        try:
+            self.itemconfigure(self._sous_titre, text=self.texte)
+        except tk.TclError:
+            pass
+
+    def set_progress(self, done=None, total=None):
+        """
+        Passe en mode determine. `set_progress(None)` revient a l'anneau
+        tournant -- utile quand une phase du calcul ne se compte pas.
+        """
+        if done is None or not total:
+            self._ratio = None
+            try:
+                self.itemconfigure(self._arc_progres, state=tk.HIDDEN)
+                for arc in self._queue_arcs:
+                    self.itemconfigure(arc, state=tk.NORMAL)
+            except tk.TclError:
+                pass
+            return
+        self._ratio = max(0.0, min(1.0, float(done) / float(total)))
+        try:
+            self.itemconfigure(self._arc_progres, state=tk.NORMAL)
+            for arc in self._queue_arcs:     # la comete cede la place a l'arc
+                self.itemconfigure(arc, state=tk.HIDDEN)
+        except tk.TclError:
+            pass
+
+    def set_color(self, couleur):
+        """Teinte l'anneau (vert a la reussite, rouge a l'echec)."""
+        try:
+            self.itemconfigure(self._arc_progres, outline=couleur)
+            self.itemconfigure(self._chrono, fill=couleur)
+            self.itemconfigure(self._tete, fill=couleur)
+        except tk.TclError:
+            pass
+
+    # -- animation -----------------------------------------------------
     def _anime(self):
-        self._angle = (self._angle + 6) % 360
-        self.itemconfigure(self._arc, start=self._angle)
-        secondes = self.elapsed()
-        self.itemconfigure(self._chrono, text=format_duree(secondes))
-        self._job = self.after(40, self._anime)
+        try:
+            self._dessine()
+        except tk.TclError:                 # widget detruit entre deux images
+            self._job = None
+            return
+        self._job = self.after(self.PERIODE, self._anime)
+
+    def _dessine(self):
+        t = time.monotonic()
+        ecoule = self.elapsed()
+
+        if self._ratio is None:
+            # --- comete : l'angle vient de l'horloge, la longueur respire ---
+            angle = -(t / self.TOUR_S) * 360.0
+            respiration = 0.5 * (1.0 - math.cos(2.0 * math.pi * (t / 3.4)))
+            etale = 0.45 + 0.55 * respiration      # de 45 % a 100 % de la comete
+            pas = 360.0 / self.SEGMENTS
+            for i, arc in enumerate(self._queue_arcs):
+                debut = angle - i * pas * etale
+                self.itemconfigure(arc, start=debut % 360.0,
+                                   extent=-pas * etale * 1.08)
+            self._place_tete(angle)
+        else:
+            # --- progression : l'arc part du haut, dans le sens horaire ---
+            self.itemconfigure(self._arc_progres, start=90.0,
+                               extent=-359.999 * self._ratio)
+            self._place_tete(90.0 - 360.0 * self._ratio)
+
+        # le chrono ne se redessine qu'au dixieme : pas de scintillement
+        texte = format_chrono(ecoule)
+        if texte != self._dernier_texte:
+            self._dernier_texte = texte
+            self.itemconfigure(self._chrono, text=texte)
+            if self._ratio is not None:
+                self.itemconfigure(self._sous_titre,
+                                   text=f"{100.0 * self._ratio:.0f} %"
+                                        + (f"  -  {self.texte}" if self.texte else ""))
+
+    def _place_tete(self, angle_deg):
+        """Pastille ronde au bout de la comete : le trait ne s'arrete pas net."""
+        r = 0.5 * (self.taille - 2 * (self.EPAISSEUR + 6))
+        cx = cy = self.taille / 2.0
+        a = math.radians(angle_deg)
+        x, y = cx + r * math.cos(a), cy - r * math.sin(a)
+        d = self.EPAISSEUR / 2.0
+        self.coords(self._tete, x - d, y - d, x + d, y + d)
+        self.itemconfigure(self._tete, state=tk.NORMAL)
 
 
 class Tooltip:
@@ -362,11 +544,11 @@ class LogConsole(tk.Frame):
     """
 
     TAGS = {
-        applog.DEBUG: ("#7E8FA3", ""),
-        applog.INFO: ("#D6E1EC", ""),
-        applog.OK: ("#6FD08C", ""),
-        applog.WARN: ("#F0BE5A", ""),
-        applog.ERROR: ("#FF8A80", ""),
+        applog.DEBUG: ("#8E8E93", ""),
+        applog.INFO: ("#E5E5EA", ""),
+        applog.OK: ("#63DA83", ""),
+        applog.WARN: ("#FFB340", ""),
+        applog.ERROR: ("#FF6961", ""),
     }
 
     def __init__(self, parent, height=8, show_debug=False, collapsed=False):
@@ -376,30 +558,35 @@ class LogConsole(tk.Frame):
         self._show_debug = bool(show_debug)
         self._paused = False
 
-        bar = tk.Frame(self, bg="#16263A")
+        bar = tk.Frame(self, bg=C["console_bar"])
         bar.pack(fill=tk.X)
-        tk.Label(bar, text="JOURNAL", font=FONTS["tiny"], bg="#16263A",
-                 fg="#7E8FA3").pack(side=tk.LEFT, padx=10, pady=4)
-        self._count_lbl = tk.Label(bar, text="", font=FONTS["tiny"], bg="#16263A",
-                                   fg="#7E8FA3")
+        tk.Label(bar, text="JOURNAL", font=FONTS["tiny"],
+                 bg=C["console_bar"], fg=C["console_dim"]).pack(
+            side=tk.LEFT, padx=12, pady=5)
+        self._count_lbl = tk.Label(bar, text="", font=FONTS["tiny"],
+                                   bg=C["console_bar"], fg=C["console_dim"])
         self._count_lbl.pack(side=tk.LEFT, padx=6)
 
         self._debug_var = tk.BooleanVar(value=self._show_debug)
         tk.Checkbutton(bar, text="details", variable=self._debug_var,
-                       command=self._toggle_debug, bg="#16263A", fg="#7E8FA3",
-                       selectcolor="#16263A", activebackground="#16263A",
-                       activeforeground="#D6E1EC", font=FONTS["tiny"],
+                       command=self._toggle_debug, bg=C["console_bar"],
+                       fg=C["console_dim"], selectcolor=C["console_bar"],
+                       activebackground=C["console_bar"],
+                       activeforeground=C["console_fg"], font=FONTS["tiny"],
                        bd=0, highlightthickness=0).pack(side=tk.RIGHT, padx=(0, 8))
-        tk.Button(bar, text="effacer", command=self.clear, bg="#16263A",
-                  fg="#7E8FA3", activebackground="#22394F", activeforeground="#D6E1EC",
-                  font=FONTS["tiny"], bd=0, highlightthickness=0,
-                  cursor="hand2").pack(side=tk.RIGHT, padx=6)
+        tk.Button(bar, text="effacer", command=self.clear,
+                  bg=C["console_bar"], fg=C["console_dim"],
+                  activebackground=C["primary_alt"],
+                  activeforeground=C["console_fg"], font=FONTS["tiny"], bd=0,
+                  highlightthickness=0, cursor="hand2").pack(side=tk.RIGHT, padx=6)
         # Sur un ecran court, le journal vaut une centaine de pixels : il se
         # replie d'un clic, et sa barre de titre reste la pour le rouvrir.
-        self._btn_fold = tk.Button(bar, text="", command=self.toggle, bg="#16263A",
-                                   fg="#7E8FA3", activebackground="#22394F",
-                                   activeforeground="#D6E1EC", font=FONTS["tiny"],
-                                   bd=0, highlightthickness=0, cursor="hand2")
+        self._btn_fold = tk.Button(bar, text="", command=self.toggle,
+                                   bg=C["console_bar"], fg=C["console_dim"],
+                                   activebackground=C["primary_alt"],
+                                   activeforeground=C["console_fg"],
+                                   font=FONTS["tiny"], bd=0,
+                                   highlightthickness=0, cursor="hand2")
         self._btn_fold.pack(side=tk.RIGHT, padx=6)
 
         self.text = tk.Text(self, height=height, bg=C["console_bg"],
@@ -412,8 +599,8 @@ class LogConsole(tk.Frame):
         self.text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         for level, (fg, _) in self.TAGS.items():
             self.text.tag_configure(f"lvl{level}", foreground=fg)
-        self.text.tag_configure("stamp", foreground="#5A6E85")
-        self.text.tag_configure("tag", foreground="#4E9BD6")
+        self.text.tag_configure("stamp", foreground="#6E6E73")
+        self.text.tag_configure("tag", foreground="#5AA9F0")
 
         self._body = (self.text, vsb)
         self._collapsed = False
@@ -632,3 +819,461 @@ def set_children_state(widget, state):
         except tk.TclError:
             pass
         set_children_state(child, state)
+
+
+# --------------------------------------------------------------------------
+# commandes dessinees : ce que ttk ne sait pas arrondir
+# --------------------------------------------------------------------------
+
+class PillButton(tk.Canvas):
+    """
+    Bouton a coins ronds, dessine sur un canevas.
+
+    Tkinter ne sait pas arrondir un bouton natif -- et c'est precisement ce
+    qui trahit une interface "faite en Tk". On dessine donc la pilule
+    soi-meme : aplat plein pour l'action principale, teinte tres claire pour
+    les actions secondaires, simple texte pour les actions discretes.
+
+    `kind` vaut "filled", "tinted", "plain" ou "danger".
+    """
+
+    HAUTEUR = 38
+    PAD_X = 22
+
+    STYLES = {
+        "filled": dict(fond="accent", texte="on_primary", bord=None),
+        "success": dict(fond="ok", texte="on_primary", bord=None),
+        "tinted": dict(fond="accent_soft", texte="accent", bord=None),
+        "plain": dict(fond="surface", texte="text", bord="border"),
+        "danger": dict(fond="error_soft", texte="error", bord=None),
+        "ghost": dict(fond=None, texte="accent", bord=None),
+    }
+
+    def __init__(self, parent, text, command=None, kind="filled", width=None,
+                 height=None, bg=None, font=None, icon=None, state=tk.NORMAL):
+        self.kind = kind if kind in self.STYLES else "filled"
+        self.bg = bg or (parent["bg"] if isinstance(parent, tk.Frame) else C["surface"])
+        self.font = font or FONTS["bold"]
+        self.texte = f"{icon}  {text}" if icon else text
+        self.command = command
+        self.hauteur = int(height or self.HAUTEUR)
+        self._etat = state
+        self._survol = False
+        self._enfonce = False
+
+        largeur = int(width or self._largeur_texte() + 2 * self.PAD_X)
+        super().__init__(parent, width=largeur, height=self.hauteur, bg=self.bg,
+                         highlightthickness=0, bd=0,
+                         cursor="hand2" if state == tk.NORMAL else "arrow")
+        self.largeur = largeur
+
+        self._forme = None
+        self._label = None
+        self._dessine()
+
+        self.bind("<Enter>", self._on_enter)
+        self.bind("<Leave>", self._on_leave)
+        self.bind("<ButtonPress-1>", self._on_press)
+        self.bind("<ButtonRelease-1>", self._on_release)
+        self.bind("<Configure>", lambda _e: self._dessine())
+
+    # -- mesure ---------------------------------------------------------
+    def _largeur_texte(self):
+        try:
+            from tkinter import font as tkfont
+            return tkfont.Font(font=self.font).measure(self.texte)
+        except tk.TclError:
+            return 8 * len(self.texte)
+
+    # -- rendu ----------------------------------------------------------
+    def _couleurs(self):
+        s = self.STYLES[self.kind]
+        fond = C[s["fond"]] if s["fond"] else self.bg
+        texte = C[s["texte"]]
+        bord = C[s["bord"]] if s["bord"] else ""
+        if self._etat == tk.DISABLED:
+            return (mix(fond, self.bg, 0.55), mix(texte, self.bg, 0.55),
+                    mix(bord, self.bg, 0.6) if bord else "")
+        if self._enfonce:
+            fond = mix(fond, "#000000", 0.14 if s["fond"] else 0.0)
+            if not s["fond"]:
+                fond = mix(self.bg, C["accent"], 0.14)
+        elif self._survol:
+            fond = mix(fond, "#000000", 0.07) if s["fond"] else \
+                mix(self.bg, C["accent"], 0.07)
+            bord = C["accent"] if bord else bord
+        return fond, texte, bord
+
+    def _dessine(self):
+        self.delete("all")
+        w = int(self.winfo_width() or self.largeur)
+        h = int(self.winfo_height() or self.hauteur)
+        fond, texte, bord = self._couleurs()
+        r = h / 2.0
+        round_rect(self, 1, 1, w - 1, h - 1, r, fill=fond,
+                   outline=bord or fond, width=1)
+        self.create_text(w / 2.0, h / 2.0 + 1, text=self.texte, fill=texte,
+                         font=self.font)
+
+    # -- interactions ---------------------------------------------------
+    def _on_enter(self, _e=None):
+        if self._etat != tk.DISABLED:
+            self._survol = True
+            self._dessine()
+
+    def _on_leave(self, _e=None):
+        self._survol = self._enfonce = False
+        self._dessine()
+
+    def _on_press(self, _e=None):
+        if self._etat != tk.DISABLED:
+            self._enfonce = True
+            self._dessine()
+
+    def _on_release(self, _e=None):
+        if self._etat == tk.DISABLED:
+            return
+        lance = self._enfonce
+        self._enfonce = False
+        self._dessine()
+        if lance and self.command:
+            self.command()
+
+    # -- API facon ttk ---------------------------------------------------
+    def configure(self, **kw):                       # noqa: D401 - API Tk
+        if "text" in kw:
+            self.texte = kw.pop("text")
+        if "state" in kw:
+            self._etat = kw.pop("state")
+            try:
+                self.config(cursor="hand2" if self._etat == tk.NORMAL else "arrow")
+            except tk.TclError:
+                pass
+        if "command" in kw:
+            self.command = kw.pop("command")
+        if "kind" in kw:
+            self.kind = kw.pop("kind")
+        if kw:
+            super().configure(**kw)
+        self._dessine()
+
+    config = configure
+
+    def set_text(self, text):
+        self.configure(text=text)
+
+
+class SegmentedControl(tk.Canvas):
+    """
+    Controle segmente facon iOS : deux ou trois options, une seule active.
+
+    C'est la bonne commande pour un choix exclusif et court -- HRH ou SHRH --
+    la ou deux boutons radio font formulaire administratif. Le curseur blanc
+    glisse d'un segment a l'autre.
+    """
+
+    HAUTEUR = 34
+    MARGE = 3
+
+    def __init__(self, parent, options, value=None, command=None, width=None,
+                 bg=None, font=None):
+        self.options = [(o, o) if isinstance(o, str) else tuple(o)
+                        for o in options]
+        self.bg = bg or C["surface"]
+        self.font = font or FONTS["small"]
+        self.command = command
+        self.value = value if value is not None else self.options[0][0]
+
+        largeur = int(width or max(92 * len(self.options), 200))
+        super().__init__(parent, width=largeur, height=self.HAUTEUR, bg=self.bg,
+                         highlightthickness=0, bd=0, cursor="hand2")
+        self.largeur = largeur
+        self._cible = self._index()          # position visee du curseur
+        self._pos = float(self._cible)       # position animee
+        self._job = None
+
+        self.bind("<Button-1>", self._on_click)
+        self.bind("<Configure>", lambda _e: self._dessine())
+        self.bind("<Destroy>", lambda _e: self._stop())
+        self._dessine()
+
+    def _index(self, value=None):
+        cible = self.value if value is None else value
+        for i, (cle, _lib) in enumerate(self.options):
+            if cle == cible:
+                return i
+        return 0
+
+    def get(self):
+        return self.value
+
+    def set(self, value, notifier=False):
+        if self._index(value) == self._index() and value == self.value:
+            return
+        self.value = value
+        self._cible = self._index()
+        self._anime()
+        if notifier and self.command:
+            self.command(self.value)
+
+    def _on_click(self, event):
+        w = int(self.winfo_width() or self.largeur)
+        i = min(len(self.options) - 1,
+                max(0, int(event.x / (w / float(len(self.options))))))
+        cle = self.options[i][0]
+        if cle != self.value:
+            self.value = cle
+            self._cible = i
+            self._anime()
+            if self.command:
+                self.command(cle)
+
+    def _stop(self):
+        if self._job is not None:
+            try:
+                self.after_cancel(self._job)
+            except tk.TclError:
+                pass
+            self._job = None
+
+    def _anime(self):
+        """Glissement amorti du curseur : 8 images suffisent a le rendre doux."""
+        self._stop()
+
+        def pas():
+            ecart = self._cible - self._pos
+            if abs(ecart) < 0.01:
+                self._pos = float(self._cible)
+                self._dessine()
+                self._job = None
+                return
+            self._pos += ecart * 0.35
+            self._dessine()
+            self._job = self.after(16, pas)
+
+        pas()
+
+    def _dessine(self):
+        self.delete("all")
+        w = int(self.winfo_width() or self.largeur)
+        h = int(self.winfo_height() or self.HAUTEUR)
+        n = max(1, len(self.options))
+        round_rect(self, 0, 0, w, h, h / 2.0, fill=C["surface_sunk"],
+                   outline=C["surface_sunk"])
+
+        larg = (w - 2 * self.MARGE) / float(n)
+        x = self.MARGE + self._pos * larg
+        round_rect(self, x, self.MARGE, x + larg, h - self.MARGE,
+                   (h - 2 * self.MARGE) / 2.0, fill=C["surface"],
+                   outline=C["border_soft"])
+
+        for i, (cle, libelle) in enumerate(self.options):
+            actif = abs(self._pos - i) < 0.5
+            self.create_text(self.MARGE + (i + 0.5) * larg, h / 2.0 + 1,
+                             text=libelle,
+                             fill=C["text"] if actif else C["muted"],
+                             font=FONTS["bold"] if actif else self.font)
+
+
+class Chip(tk.Canvas):
+    """Petite pastille d'information a coins ronds (etat, compteur, filtre)."""
+
+    def __init__(self, parent, text="", kind="neutral", bg=None, font=None):
+        self.bg = bg or C["surface"]
+        self.font = font or FONTS["tiny"]
+        self.texte = text
+        self.kind = kind
+        super().__init__(parent, height=22, bg=self.bg, highlightthickness=0,
+                         bd=0, width=self._largeur())
+        self.bind("<Configure>", lambda _e: self._dessine())
+        self._dessine()
+
+    TONS = {
+        "neutral": ("surface_sunk", "muted"),
+        "info": ("accent_soft", "accent"),
+        "ok": ("ok_soft", "ok"),
+        "warn": ("warn_soft", "warn"),
+        "error": ("error_soft", "error"),
+    }
+
+    def _largeur(self):
+        try:
+            from tkinter import font as tkfont
+            return tkfont.Font(font=self.font).measure(self.texte) + 22
+        except tk.TclError:
+            return 7 * len(self.texte) + 22
+
+    def set(self, text=None, kind=None):
+        if text is not None:
+            self.texte = text
+        if kind is not None:
+            self.kind = kind
+        self.configure(width=self._largeur())
+        self._dessine()
+
+    def _dessine(self):
+        self.delete("all")
+        w = int(self.winfo_width() or self._largeur())
+        h = int(self.winfo_height() or 22)
+        fond, texte = self.TONS.get(self.kind, self.TONS["neutral"])
+        round_rect(self, 0, 1, w, h - 1, (h - 2) / 2.0, fill=C[fond],
+                   outline=C[fond])
+        self.create_text(w / 2.0, h / 2.0, text=self.texte, fill=C[texte],
+                         font=self.font)
+
+
+class SoftCard(tk.Frame):
+    """
+    Carte blanche a coins ronds et ombre douce.
+
+    Tk ne connait ni `border-radius` ni `box-shadow` : l'ombre est un canevas
+    place derriere la carte, sur lequel on empile trois rectangles arrondis
+    de plus en plus clairs. De pres ce n'est pas un flou gaussien ; a l'ecran,
+    la carte decolle du fond exactement comme il faut.
+    """
+
+    def __init__(self, parent, padding=18, radius=None, bg=None, shadow=True,
+                 **kw):
+        self.fond = bg or C["bg"]
+        self.rayon = int(radius or RADIUS["lg"])
+        super().__init__(parent, bg=self.fond, **kw)
+
+        self._fond_canvas = tk.Canvas(self, bg=self.fond, highlightthickness=0,
+                                      bd=0)
+        self._fond_canvas.place(x=0, y=0, relwidth=1.0, relheight=1.0)
+        self._ombre = bool(shadow)
+
+        self.body = tk.Frame(self, bg=C["surface"])
+        self.body.pack(fill=tk.BOTH, expand=True, padx=padding, pady=padding)
+        self.bind("<Configure>", self._dessine)
+
+    def _dessine(self, _event=None):
+        cv = self._fond_canvas
+        cv.delete("all")
+        w, h = self.winfo_width(), self.winfo_height()
+        if w < 4 or h < 4:
+            return
+        if self._ombre:
+            for i, t in enumerate((0.35, 0.55, 0.75)):
+                d = 3 - i
+                round_rect(cv, d, d + 1, w - d, h - d + 1, self.rayon + d,
+                           fill=mix(C["border"], self.fond, t), outline="")
+        round_rect(cv, 0, 0, w - 1, h - 3, self.rayon, fill=C["surface"],
+                   outline=C["border_soft"])
+
+
+class HeaderBar(tk.Frame):
+    """
+    Bandeau de tete : titre, sous-titre, zone d'actions a droite.
+
+    Fond presque noir, texte blanc, un filet clair en bas : la barre de titre
+    des applications macOS recentes.
+    """
+
+    def __init__(self, parent, title, subtitle="", badge=None, height=74):
+        super().__init__(parent, bg=C["primary"], height=height)
+        self.pack_propagate(False)
+
+        gauche = tk.Frame(self, bg=C["primary"])
+        gauche.pack(side=tk.LEFT, fill=tk.Y, padx=22)
+        interieur = tk.Frame(gauche, bg=C["primary"])
+        interieur.pack(expand=True)
+
+        ligne = tk.Frame(interieur, bg=C["primary"])
+        ligne.pack(anchor="w")
+        self.lbl_titre = tk.Label(ligne, text=title, bg=C["primary"],
+                                  fg=C["on_primary"], font=FONTS["h1"])
+        self.lbl_titre.pack(side=tk.LEFT)
+        if badge:
+            Chip(ligne, text=badge, kind="info",
+                 bg=C["primary"]).pack(side=tk.LEFT, padx=10, pady=(6, 0))
+
+        self.lbl_sous = tk.Label(interieur, text=subtitle, bg=C["primary"],
+                                 fg=C["on_primary_muted"], font=FONTS["small"],
+                                 anchor="w", justify="left")
+        self.lbl_sous.pack(anchor="w", pady=(2, 0))
+
+        self.actions = tk.Frame(self, bg=C["primary"])
+        self.actions.pack(side=tk.RIGHT, padx=18)
+
+    def set_subtitle(self, text):
+        self.lbl_sous.config(text=text)
+
+    def set_title(self, text):
+        self.lbl_titre.config(text=text)
+
+
+class StepDots(tk.Canvas):
+    """
+    Fil d'etapes minimaliste : des pastilles reliees par un trait.
+
+    L'etape en cours s'allonge en gelule et porte son nom ; les etapes
+    franchies se remplissent d'une coche ; les suivantes restent des cercles
+    vides numerotes. C'est lisible d'un coup d'oeil, et ca tient sur une
+    seule ligne meme avec cinq etapes.
+    """
+
+    HAUTEUR = 30
+
+    def __init__(self, parent, steps, bg=None, height=None):
+        self.etapes = list(steps)
+        self.bg = bg or C["bg"]
+        self.index = 0
+        super().__init__(parent, height=int(height or self.HAUTEUR), bg=self.bg,
+                         highlightthickness=0, bd=0)
+        self.bind("<Configure>", lambda _e: self._dessine())
+
+    def set_index(self, index):
+        self.index = max(0, min(len(self.etapes) - 1, int(index)))
+        self._dessine()
+
+    def _mesure(self, texte, font):
+        try:
+            from tkinter import font as tkfont
+            return tkfont.Font(font=font).measure(texte)
+        except tk.TclError:
+            return 7 * len(texte)
+
+    def _dessine(self):
+        self.delete("all")
+        w = int(self.winfo_width() or 480)
+        h = int(self.winfo_height() or self.HAUTEUR)
+        n = max(1, len(self.etapes))
+        cy = h / 2.0
+        pas = w / float(n)
+        r = min(9.0, (h - 6) / 2.0)
+
+        demi = []                      # demi-largeur de chaque jalon
+        for i, nom in enumerate(self.etapes):
+            if i == self.index:
+                demi.append(self._mesure(nom, FONTS["tiny"]) / 2.0 + 14.0)
+            else:
+                demi.append(r)
+
+        for i, nom in enumerate(self.etapes):
+            cx = (i + 0.5) * pas
+            fait = i < self.index
+            actif = i == self.index
+            if i:
+                x0 = (i - 0.5) * pas + demi[i - 1] + 6
+                x1 = cx - demi[i] - 6
+                if x1 > x0:
+                    self.create_line(x0, cy, x1, cy, width=2,
+                                     fill=C["accent"] if fait else C["border_soft"])
+            if actif:
+                round_rect(self, cx - demi[i], cy - r, cx + demi[i], cy + r, r,
+                           fill=C["accent"], outline=C["accent"])
+                self.create_text(cx, cy + 1, text=nom, fill=C["on_primary"],
+                                 font=FONTS["tiny"])
+            elif fait:
+                self.create_oval(cx - r, cy - r, cx + r, cy + r,
+                                 fill=C["accent"], outline=C["accent"])
+                # coche dessinee : aucune police ne la garantit
+                self.create_line(cx - 4, cy, cx - 1, cy + 3.5, cx + 4.5, cy - 4,
+                                 fill=C["on_primary"], width=2,
+                                 capstyle=tk.ROUND, joinstyle=tk.ROUND)
+            else:
+                self.create_oval(cx - r, cy - r, cx + r, cy + r, fill=self.bg,
+                                 outline=C["border"], width=2)
+                self.create_text(cx, cy + 1, text=str(i + 1), fill=C["faint"],
+                                 font=FONTS["tiny"])
